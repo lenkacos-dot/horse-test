@@ -50,6 +50,14 @@ def _parse_simple_yaml(text):
                 val = False
             elif val == '' or val == '{}':
                 val = {}
+            elif val.startswith('[') and val.endswith(']'):
+                # 解析 YAML 行内列表 [item1, item2]
+                raw = val[1:-1]
+                items = []
+                for item in re.split(r',\s*', raw):
+                    item = item.strip().strip('"').strip("'")
+                    if item: items.append(item)
+                val = items
             result[key] = val
     return result if result else None
 
@@ -136,9 +144,17 @@ def _find_process(name_pattern):
                                capture_output=True, text=True, timeout=5)
             return name_pattern.lower() in r.stdout.lower()
         else:  # macOS / Linux
+            # 精确匹配：只匹配进程 cmdline，避免文件名误匹配
             r = subprocess.run(["pgrep", "-f", name_pattern],
                                capture_output=True, text=True, timeout=3)
-            return r.returncode == 0
+            if r.returncode != 0: return False
+            for pid in r.stdout.strip().splitlines():
+                try:
+                    cmd = subprocess.run(["ps", "-p", pid, "-o", "command="],
+                                         capture_output=True, text=True, timeout=3).stdout
+                    if re.search(name_pattern, cmd.lower()): return True
+                except: continue
+            return False
     except: return False
 
 def safe_read(path, max_lines=200):
@@ -203,7 +219,9 @@ def analyze_security_rules(content):
     text = content.lower()
     count = len(re.findall(r'(?:禁止|不允许|不要|拒绝|不能|forbidden|do not)',text,re.I))
     return {"count":count,"quality":min(count*3,15),
-            "has_forbidden_paths":bool(re.search(r'[/\\]',content)),
+            "has_forbidden_paths":bool(re.search(
+                r'(?:禁止|不允许|不要|拒绝|不能|forbidden|do not).*(?:~/|/Users/|/home/|/var/|/etc/|路径|path|目录|dir)',
+                content, re.I)),
             "has_sensitive_files":bool(re.search(r'(?:\.env|\.git|\.ssh|\.aws|secret|token|key)',text,re.I)),
             "has_operation_restrict":bool(re.search(r'\b(?:rm|del|exec|eval|sudo)\b',text,re.I)),
             "has_confirm":bool(re.search(r'确认|confirm|二次|ask',text,re.I))}
@@ -239,9 +257,9 @@ def load_history():
         except: return []
     return []
 
-def save_history(hts, dim_scores):
+def save_history(hts, base, dim_scores):
     h = load_history()
-    h.append({"date":datetime.datetime.now().isoformat(),"hts":hts,"dimensions":dim_scores})
+    h.append({"date":datetime.datetime.now().isoformat(),"hts":hts,"base":base,"dimensions":dim_scores})
     h = h[-30:]
     HISTORY_FILE.parent.mkdir(parents=True,exist_ok=True)
     with open(HISTORY_FILE,'w',encoding='utf-8') as f:
@@ -292,7 +310,7 @@ class Scanner:
            "proxy":False,"token_opt":{},"has_cross_profile":False,"text":""}
         for p in [HERMES_HOME/"config.yaml",HERMES_HOME/"config.yml"]:
             if p.is_file():
-                c["text"]=safe_read(p,400); break
+                c["text"]=safe_read_all(p); break
         if c["text"]:
             t=c["text"]
             c["provider_count"]=len(re.findall(r'provider\s*:',t,re.I))
@@ -347,12 +365,12 @@ class Scanner:
 
     def _tools(self):
         t={"installed":[],"gateway":False}
-        for p in [Path.home()/".local"/"bin",Path.home()/".hermes"/"node"/"bin",
-                  Path.home()/".hermes"/"node","/opt/homebrew/bin","/usr/local/bin"]:
-            if str(p) not in os.environ.get("PATH",""):
-                os.environ["PATH"]=f"{p}:"+os.environ.get("PATH","")
+        extra_paths = [str(Path.home()/".local"/"bin"), str(Path.home()/".hermes"/"node"/"bin"),
+                       str(Path.home()/".hermes"/"node"), "/opt/homebrew/bin", "/usr/local/bin"]
+        ex_path = ":".join(extra_paths)
+        cur_path = os.environ.get("PATH","")
         for cmd in ["pipx","ffmpeg","gbrain","crush","node","bun","playwright","python3"]:
-            if shutil.which(cmd): t["installed"].append(cmd)
+            if shutil.which(cmd, path=f"{ex_path}:{cur_path}"): t["installed"].append(cmd)
         if (Path.home()/".cache"/"ms-playwright").is_dir() and "playwright" not in t["installed"]:
             t["installed"].append("playwright")
         # Gateway 进程检测（跨平台）
@@ -441,7 +459,7 @@ class Scorer:
         det["pr_context"]=18 if re.search(r'max_turns?\s*[:=]',cfg,re.I) else 10
         descs=s.get("descriptions",[])
         has_cn=any('中文' in d.get("content","") for d in descs)
-        has_en=any(len(re.findall(r'[a-zA-Z]{10,}',d.get("content","")))>0 for d in descs)
+        has_en=any(len(re.findall(r'[a-zA-Z]{8,}',d.get("content","")))>0 for d in descs)
         det["pr_lang"]=15 if has_cn and has_en else 8
         has_ex=any('example' in d.get("content","").lower() or '示例' in d.get("content","") for d in descs)
         det["pr_clarity"]=15 if has_ex else 8
@@ -467,7 +485,7 @@ class Scorer:
         det["op_memory"]=18 if ops.get("history") else 10
         det["op_iteration"]=18 if len(load_history())>=2 else 12
         det["op_community"]=20 if ops.get("community") else 8
-        det["op_docs"]=min(20+(ops.get("notes_count",0)),20) if ops.get("notes") else 8
+        det["op_docs"]=min(8+ops.get("notes_count",0)*4, 20) if ops.get("notes") else 8
         det["op_automation"]=min(self.d.get("cron",{}).get("count",0)*3,15)
         return {"score":sum(det.values()),"details":det}
 
@@ -543,8 +561,8 @@ def print_report(scorer, hts, base, beta, tier, suggestions, history):
     print(f"  📐 算法: 加权几何平均 HTS = ∏(Sᵢ^Wᵢ)")
     print(f"     基础 HTS: {base}  |  趋势修正 β: {beta:.2f}  |  最终得分: {hts}")
     if history:
-        p=history[-1].get("hts",0); d=hts-p
-        print(f"     上次评分: {p}  {'📈' if d>0 else '📉' if d<0 else '➖'} {d:+.1f}")
+        p_base=history[-1].get("base",0); p_hts=history[-1].get("hts",0); d=base-p_base
+        print(f"     上次评分: HTS {p_hts}  |  基础分: {p_base} → {base} {'📈' if d>0 else '📉' if d<0 else '➖'} {d:+.1f}")
     print(f"\n  🏆 当前段位: {tier['icon']} {tier['name']} (第{TIERS.index(tier)+1}段/共{len(TIERS)}段)")
     print(f"     {tier['desc']}")
     nxt=TIERS.index(tier)+1
@@ -610,6 +628,9 @@ def gen_word_report(scorer, hts, base, beta, tier, suggestions, dim_scores, sdat
         did=dim["id"]; ds=dim_scores.get(did,0)
         doc.add_heading(f'{dim["icon"]} {dim["name"]} — {ds:.1f}/100 (权重{dim["weight"]*100:.0f}%)',level=2)
         dets=scorer.scores.get(did,{}).get("details",{})
+        if not dets:
+            doc.add_paragraph(f'⚠️ 维度 {dim["name"]}({did}) 评分数据缺失，请检查 Scanner 扫描结果')
+            continue
         items=dim["items"]
         t=doc.add_table(rows=len(items)+1,cols=4); t.style='Light Grid Accent 1'
         hdr(t,['评估项','得分','满分','评分标准'])
@@ -662,25 +683,53 @@ def gen_word_report(scorer, hts, base, beta, tier, suggestions, dim_scores, sdat
             p=doc.add_paragraph(); r=p.add_run(f'{i}. {tag} {s["icon"]} {s["dimension"]}'); sf(r,bold=True)
             doc.add_paragraph(f'   → {s["suggestion"]}')
     else: doc.add_paragraph('✅ 各维度表现优秀！')
-    path=Path.home()/"Desktop"/f'养马测试报告_v4_{datetime.date.today().strftime("%Y%m%d")}.docx'
+    desktop = Path.home() / "Desktop"
+    if not desktop.is_dir():
+        desktop = Path.home() / "桌面"
+        if not desktop.is_dir():
+            desktop = Path.home()  # fallback to home
+    path=desktop/f'养马测试报告_v4_{datetime.date.today().strftime("%Y%m%d")}.docx'
     doc.save(path); return str(path)
 
 # ============================================================
 # 主入口
 # ============================================================
 def main():
-    print("🔍 养马测试 v4.0 — 正在扫描 Hermes Agent 环境...")
+    import argparse
+    ap = argparse.ArgumentParser(description="养马测试 v4.0 — Hermes Agent 调教评分系统")
+    ap.add_argument("--json", action="store_true", help="仅输出 JSON 评分结果")
+    ap.add_argument("--no-word", action="store_true", help="跳过 Word 报告生成")
+    ap.add_argument("--quiet", action="store_true", help="仅输出总分和等级")
+    args = ap.parse_args()
+
+    if not args.quiet:
+        print("🔍 养马测试 v4.0 — 正在扫描 Hermes Agent 环境...")
     sc=Scanner(); sr=Scorer(sc); sr.run()
-    h=load_history(); prev=h[-1].get("hts") if h else None
-    hts,base,beta=calculate_hts(sr.dim_scores,prev)
+    h=load_history(); prev_base=h[-1].get("base") if h else None; prev_hts=h[-1].get("hts") if h else None
+    # 旧格式历史无 base 字段 → 不使用趋势修正（防止 base=0 触发异常 delta）
+    if prev_base is not None and prev_base == 0 and h and "base" not in h[-1]:
+        prev_base = None
+    hts,base,beta=calculate_hts(sr.dim_scores,prev_base)
     tier=get_tier(hts); sug=gen_suggestions(sr) if hts<800 else []
-    print_report(sr,hts,base,beta,tier,sug,h)
-    save_history(hts,sr.dim_scores)
-    wp=gen_word_report(sr,hts,base,beta,tier,sug,sr.dim_scores,sc.data)
-    if wp: print(f"\n  📄 Word 报告: {wp}")
-    print(f"\n💬 SUMMARY|HTS={hts}|TIER={tier['name']}|DIMS=",end="")
-    for dim in DIMENSIONS: print(f"{dim['id']}={sr.dim_scores.get(dim['id'],0):.0f}",end=",")
-    print()
+
+    if args.json:
+        import json as j
+        print(j.dumps({"hts":hts,"base":base,"beta":beta,
+            "tier":{"name":tier["name"],"en":tier["en"],"icon":tier["icon"]},
+            "dimensions":{d["id"]:sr.dim_scores.get(d["id"],0) for d in DIMENSIONS}},
+            ensure_ascii=False,indent=2))
+    elif args.quiet:
+        print(f"HTS={hts}|TIER={tier['name']}|{tier['icon']}")
+    else:
+        print_report(sr,hts,base,beta,tier,sug,h)
+    save_history(hts,base,sr.dim_scores)
+    if not args.no_word:
+        wp=gen_word_report(sr,hts,base,beta,tier,sug,sr.dim_scores,sc.data)
+        if wp: print(f"\n  📄 Word 报告: {wp}")
+    if not args.quiet and not args.json:
+        print(f"\n💬 SUMMARY|HTS={hts}|TIER={tier['name']}|DIMS=",end="")
+        for dim in DIMENSIONS: print(f"{dim['id']}={sr.dim_scores.get(dim['id'],0):.0f}",end=",")
+        print()
 
 if __name__=="__main__":
     main()
