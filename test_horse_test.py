@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""养马测试 v4.0 单元测试"""
+"""Horse Test v4.0 Unit Tests"""
 import unittest, tempfile, os, json
 from pathlib import Path
 
-# 确保 horse_test 模块可导入
+# Ensure horse_test module can be imported
 import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
 import horse_test as ht
 
@@ -43,7 +43,7 @@ class TestConfigTokenOpt(unittest.TestCase):
 
 class TestSecurityRules(unittest.TestCase):
     def test_with(self):
-        r=ht.analyze_security_rules("禁止读取 ~/.ssh\n不要删除 .env")
+        r=ht.analyze_security_rules("forbidden access to ~/.ssh\ndo not delete .env")
         self.assertGreater(r["count"],0); self.assertTrue(r["has_forbidden_paths"])
     def test_without(self):
         r=ht.analyze_security_rules("")
@@ -59,15 +59,15 @@ class TestHTS(unittest.TestCase):
 
 class TestTier(unittest.TestCase):
     def test_tiers(self):
-        self.assertEqual(ht.get_tier(50)["name"],"马夫")
-        self.assertEqual(ht.get_tier(850)["name"],"马神")
+        self.assertEqual(ht.get_tier(50)["name"],"Stable Boy")
+        self.assertEqual(ht.get_tier(850)["name"],"Horse God")
 
 class TestHistory(unittest.TestCase):
     def test_save_load(self):
         orig=ht.HISTORY_FILE
         with tempfile.TemporaryDirectory() as tmp:
             ht.HISTORY_FILE=Path(tmp)/"test.json"
-            h=ht.save_history(500.0,{"skills":70})
+            h=ht.save_history(500.0, 500.0, {"skills":70})
             self.assertEqual(len(h),1); self.assertEqual(h[0]["hts"],500.0)
             self.assertEqual(len(ht.load_history()),1)
         ht.HISTORY_FILE=orig

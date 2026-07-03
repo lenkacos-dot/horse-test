@@ -337,7 +337,7 @@ horse-test/
 ├── SKILL.md                  # Hermes skill definition
 ├── DESCRIPTION.md            # Auto-detect description (very short, saves tokens)
 ├── CHANGELOG.md              # Version history
-├── 使用笔记.md               # User tuning notes
+├── usage-notes.md            # User tuning notes
 └── README.md                 # This file
 ```
 

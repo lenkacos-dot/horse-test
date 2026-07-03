@@ -50,6 +50,14 @@ def _parse_simple_yaml(text):
                 val = False
             elif val == '' or val == '{}':
                 val = {}
+            elif val.startswith('[') and val.endswith(']'):
+                # Parse YAML inline list [item1, item2]
+                raw = val[1:-1]
+                items = []
+                for item in re.split(r',\s*', raw):
+                    item = item.strip().strip('"').strip("'")
+                    if item: items.append(item)
+                val = items
             result[key] = val
     return result if result else None
 
@@ -67,7 +75,7 @@ def extract_frontmatter(content):
 # Six-Dimension Scoring Model
 # ============================================================
 DIMENSIONS = [
-    {"id":"skills","icon":"🧠","name":"Skills","weight":0.25,"items":[
+    {"id":"skills","icon":"🧠","name":"Skills System","weight":0.25,"items":[
         {"id":"skill_count","label":"Skill Count","max":25},
         {"id":"skill_desc","label":"Skill Description Quality","max":25},
         {"id":"skill_coverage","label":"Domain Coverage","max":20},
@@ -96,7 +104,7 @@ DIMENSIONS = [
         {"id":"tool_external","label":"External Toolchain","max":25},
         {"id":"tool_api","label":"API Integration","max":20},
     ]},
-    {"id":"operations","icon":"📊","name":"Operations","weight":0.10,"items":[
+    {"id":"operations","icon":"📊","name":"Operations Level","weight":0.10,"items":[
         {"id":"op_memory","label":"Memory Quality","max":25},
         {"id":"op_iteration","label":"Iterative Optimization","max":20},
         {"id":"op_community","label":"Community Engagement","max":20},
@@ -136,9 +144,17 @@ def _find_process(name_pattern):
                                capture_output=True, text=True, timeout=5)
             return name_pattern.lower() in r.stdout.lower()
         else:  # macOS / Linux
+            # Exact match: only match process cmdline to avoid filename false matches
             r = subprocess.run(["pgrep", "-f", name_pattern],
                                capture_output=True, text=True, timeout=3)
-            return r.returncode == 0
+            if r.returncode != 0: return False
+            for pid in r.stdout.strip().splitlines():
+                try:
+                    cmd = subprocess.run(["ps", "-p", pid, "-o", "command="],
+                                         capture_output=True, text=True, timeout=3).stdout
+                    if re.search(name_pattern, cmd.lower()): return True
+                except: continue
+            return False
     except: return False
 
 def safe_read(path, max_lines=200):
@@ -189,8 +205,8 @@ def analyze_config_token_optimization(text):
     """Analyze config.yaml for token optimization settings (v4.0: adopted from v3.0)"""
     has_max_tk = bool(re.search(r'max_tokens?\s*[:=]',text,re.I)) if text else False
     has_ctx = bool(re.search(r'context[_\\s]?window|max_turns?\s*[:=]',text,re.I)) if text else False
-    has_cmp = bool(re.search(r'compress|精减|摘要|summar',text,re.I)) if text else False
-    has_dis = bool(re.search(r'disabl|禁用|排除|exclud',text,re.I)) if text else False
+    has_cmp = bool(re.search(r'compress|summar',text,re.I)) if text else False
+    has_dis = bool(re.search(r'disable|exclud',text,re.I)) if text else False
     score = (5 + (4 if has_max_tk else 0) + (3 if has_ctx else 0)
              + (2 if has_cmp else 0) + (1 if has_dis else 0))
     return {"has_max_tokens":has_max_tk,"has_context_window":has_ctx,
@@ -201,12 +217,14 @@ def analyze_security_rules(content):
     if not content: return {"count":0,"quality":0,"has_forbidden_paths":False,"has_sensitive_files":False,
                            "has_operation_restrict":False,"has_confirm":False}
     text = content.lower()
-    count = len(re.findall(r'(?:forbidden|do not|禁止|不允许|不要|拒绝|不能)',text,re.I))
+    count = len(re.findall(r'(?:forbidden|do not|refuse|deny)',text,re.I))
     return {"count":count,"quality":min(count*3,15),
-            "has_forbidden_paths":bool(re.search(r'[/\\\\]',content)),
+            "has_forbidden_paths":bool(re.search(
+                r'(?:forbidden|do not|refuse|deny).*(?:~/|/Users/|/home/|/var/|/etc/|path|dir)',
+                content, re.I)),
             "has_sensitive_files":bool(re.search(r'(?:\.env|\.git|\.ssh|\.aws|secret|token|key)',text,re.I)),
             "has_operation_restrict":bool(re.search(r'\b(?:rm|del|exec|eval|sudo)\b',text,re.I)),
-            "has_confirm":bool(re.search(r'confirm|二次|ask|确认',text,re.I))}
+            "has_confirm":bool(re.search(r'confirm|ask|double.check',text,re.I))}
 
 # ============================================================
 # HTS Calculation
@@ -239,9 +257,9 @@ def load_history():
         except: return []
     return []
 
-def save_history(hts, dim_scores):
+def save_history(hts, base, dim_scores):
     h = load_history()
-    h.append({"date":datetime.datetime.now().isoformat(),"hts":hts,"dimensions":dim_scores})
+    h.append({"date":datetime.datetime.now().isoformat(),"hts":hts,"base":base,"dimensions":dim_scores})
     h = h[-30:]
     HISTORY_FILE.parent.mkdir(parents=True,exist_ok=True)
     with open(HISTORY_FILE,'w',encoding='utf-8') as f:
@@ -292,7 +310,7 @@ class Scanner:
            "proxy":False,"token_opt":{},"has_cross_profile":False,"text":""}
         for p in [HERMES_HOME/"config.yaml",HERMES_HOME/"config.yml"]:
             if p.is_file():
-                c["text"]=safe_read(p,400); break
+                c["text"]=safe_read_all(p); break
         if c["text"]:
             t=c["text"]
             c["provider_count"]=len(re.findall(r'provider\s*:',t,re.I))
@@ -347,12 +365,12 @@ class Scanner:
 
     def _tools(self):
         t={"installed":[],"gateway":False}
-        for p in [Path.home()/".local"/"bin",Path.home()/".hermes"/"node"/"bin",
-                  Path.home()/".hermes"/"node","/opt/homebrew/bin","/usr/local/bin"]:
-            if str(p) not in os.environ.get("PATH",""):
-                os.environ["PATH"]=f"{p}:"+os.environ.get("PATH","")
+        extra_paths = [str(Path.home()/".local"/"bin"), str(Path.home()/".hermes"/"node"/"bin"),
+                       str(Path.home()/".hermes"/"node"), "/opt/homebrew/bin", "/usr/local/bin"]
+        ex_path = ":".join(extra_paths)
+        cur_path = os.environ.get("PATH","")
         for cmd in ["pipx","ffmpeg","gbrain","crush","node","bun","playwright","python3"]:
-            if shutil.which(cmd): t["installed"].append(cmd)
+            if shutil.which(cmd, path=f"{ex_path}:{cur_path}"): t["installed"].append(cmd)
         if (Path.home()/".cache"/"ms-playwright").is_dir() and "playwright" not in t["installed"]:
             t["installed"].append("playwright")
         # Gateway process detection (cross-platform)
@@ -382,7 +400,7 @@ class Scanner:
         o={"history":HISTORY_FILE.is_file(),"notes":False,"community":False,"notes_count":0}
         sk=HERMES_HOME/"skills"
         if sk.is_dir():
-            o["notes_count"]=len(list(sk.glob("*/使用笔记.md")))+len(list(sk.glob("*/notes.md")))
+            o["notes_count"]=len(list(sk.glob("*/notes.md")))
             o["notes"]=o["notes_count"]>0
             o["community"]=any(
                 ('tap' in d.lower() or 'community' in d.lower() or 'github.com' in (safe_read(sk/d/"SKILL.md",20)).lower())
@@ -440,10 +458,10 @@ class Scorer:
         cfg=self.d.get("config",{}).get("text","")
         det["pr_context"]=18 if re.search(r'max_turns?\s*[:=]',cfg,re.I) else 10
         descs=s.get("descriptions",[])
-        has_cn=any('chinese' in d.get("content","").lower() or '中文' in d.get("content","") for d in descs)
-        has_en=any(len(re.findall(r'[a-zA-Z]{10,}',d.get("content","")))>0 for d in descs)
+        has_cn=any('chinese' in d.get("content","").lower() for d in descs)
+        has_en=any(len(re.findall(r'[a-zA-Z]{8,}',d.get("content","")))>0 for d in descs)
         det["pr_lang"]=15 if has_cn and has_en else 8
-        has_ex=any('example' in d.get("content","").lower() or '示例' in d.get("content","") for d in descs)
+        has_ex=any('example' in d.get("content","").lower() for d in descs)
         det["pr_clarity"]=15 if has_ex else 8
         return {"score":sum(det.values()),"details":det}
 
@@ -467,7 +485,7 @@ class Scorer:
         det["op_memory"]=18 if ops.get("history") else 10
         det["op_iteration"]=18 if len(load_history())>=2 else 12
         det["op_community"]=20 if ops.get("community") else 8
-        det["op_docs"]=min(20+(ops.get("notes_count",0)),20) if ops.get("notes") else 8
+        det["op_docs"]=min(8+ops.get("notes_count",0)*4, 20) if ops.get("notes") else 8
         det["op_automation"]=min(self.d.get("cron",{}).get("count",0)*3,15)
         return {"score":sum(det.values()),"details":det}
 
@@ -504,18 +522,18 @@ def gen_suggestions(scorer):
                  "Create Cron scheduled tasks (watchdog, daily report, health check)"],
         "operations":["Optimize memory: periodically clean expired entries, keep it lean and high-signal",
                        "Engage with the community: share skills on Skill Tap, submit PRs",
-                       "Write usage notes and best practice records",
-                       "Configure automated ops scripts and monitoring tasks"],
-        "security":["Add specific privacy rules to ~/.hermes.md (forbidden paths/sensitive files/operation restrictions/confirmation mechanisms)",
+                       "Write usage notes and best practices documentation",
+                       "Configure automated maintenance scripts and monitoring tasks"],
+        "security":["Add specific privacy rules in ~/.hermes.md (forbidden paths / sensitive files / operation restrictions / confirmation mechanism)",
                     "Configure cross_profile protection in config.yaml",
-                    "Add sensitive file isolation policies",
-                    "Establish a two-step confirmation mechanism for dangerous operations"],
+                    "Add sensitive file isolation strategy",
+                    "Establish a double-confirmation mechanism for dangerous operations"],
     }
     out=[]
     for dim in DIMENSIONS:
         ds=scorer.dim_scores.get(dim["id"],0)
         if ds<60:
-            items=SUG.get(dim["id"],["Keep optimizing"])
+            items=SUG.get(dim["id"],["Continue optimizing"])
             idx=0 if ds<30 else 1 if ds<50 else 2
             out.append({"priority":"high" if ds<40 else "medium","dimension":dim["name"],
                         "icon":dim["icon"],"score":ds,"suggestion":items[min(idx,len(items)-1)]})
@@ -538,18 +556,18 @@ def print_report(scorer, hts, base, beta, tier, suggestions, history):
     for dim in DIMENSIONS:
         ds=scorer.dim_scores.get(dim["id"],0)
         bar="█"*int(ds/100*30)+"░"*(30-int(ds/100*30))
-        print(f"  {dim['icon']} {dim['name']:<15s} {bar} {ds:5.1f}/100 (weight {dim['weight']*100:.0f}%)")
+        print(f"  {dim['icon']} {dim['name']:<12s} {bar} {ds:5.1f}/100 (weight {dim['weight']*100:.0f}%)")
     print(f"  {'─'*58}")
     print(f"  📐 Algorithm: Weighted Geometric Mean HTS = ∏(Sᵢ^Wᵢ)")
     print(f"     Base HTS: {base}  |  Trend Correction β: {beta:.2f}  |  Final Score: {hts}")
     if history:
-        p=history[-1].get("hts",0); d=hts-p
-        print(f"     Previous Score: {p}  {'📈' if d>0 else '📉' if d<0 else '➖'} {d:+.1f}")
+        p_base=history[-1].get("base",0); p_hts=history[-1].get("hts",0); d=base-p_base
+        print(f"     Previous: HTS {p_hts}  |  Base: {p_base} → {base} {'📈' if d>0 else '📉' if d<0 else '➖'} {d:+.1f}")
     print(f"\n  🏆 Current Rank: {tier['icon']} {tier['name']} (Rank {TIERS.index(tier)+1}/{len(TIERS)})")
     print(f"     {tier['desc']}")
     nxt=TIERS.index(tier)+1
     if nxt<len(TIERS):
-        need=TIERS[nxt]["min"]-hts; print(f"     {need:.1f} points needed for next rank '{TIERS[nxt]['icon']}{TIERS[nxt]['name']}'")
+        need=TIERS[nxt]["min"]-hts; print(f"     Need {need:.1f} points for next rank '{TIERS[nxt]['icon']}{TIERS[nxt]['name']}'")
     if suggestions:
         print(f"\n  💡 Suggestions:")
         for i,s in enumerate(suggestions[:5],1):
@@ -566,7 +584,7 @@ def gen_word_report(scorer, hts, base, beta, tier, suggestions, dim_scores, sdat
         from docx.oxml.ns import qn
         from docx.oxml import OxmlElement
     except ImportError:
-        print("  ⚠️ python-docx is not installed, skipping Word report")
+        print("  ⚠️ python-docx not installed, skipping Word report")
         return None
     doc=Document()
     def sf(run,sz=Pt(10),color=None,bold=False):
@@ -595,21 +613,24 @@ def gen_word_report(scorer, hts, base, beta, tier, suggestions, dim_scores, sdat
     # Score overview
     doc.add_heading('📊 Score Overview',level=1)
     tbl=doc.add_table(rows=7,cols=4); tbl.style='Light Grid Accent 1'
-    hdr(tbl,['Dimension','Score','Weight','Evaluation'])
+    hdr(tbl,['Dimension','Score','Weight','Rating'])
     for ri,dim in enumerate(DIMENSIONS):
         ds=dim_scores.get(dim["id"],0); tbl.rows[ri+1].cells[0].text=f'{dim["icon"]} {dim["name"]}'
         tbl.rows[ri+1].cells[1].text=f'{ds:.1f}/100'; tbl.rows[ri+1].cells[2].text=f'{dim["weight"]*100:.0f}%'
-        tbl.rows[ri+1].cells[3].text='⭐ Excellent' if ds>=80 else '✅ Good' if ds>=60 else '🔧 Fair' if ds>=40 else '🔴 Needs Improvement'
-    tbl.rows[6].cells[0].text='🏆 Overall (HTS)'; tbl.rows[6].cells[1].text=f'{hts}/1000'
+        tbl.rows[ri+1].cells[3].text='⭐ Excellent' if ds>=80 else '✅ Good' if ds>=60 else '🔧 Fair' if ds>=40 else '🔴 Needs Work'
+    tbl.rows[6].cells[0].text='🏆 Composite (HTS)'; tbl.rows[6].cells[1].text=f'{hts}/1000'
     tbl.rows[6].cells[2].text='100%'; tbl.rows[6].cells[3].text=f'{tier["icon"]} {tier["name"]}'
     doc.add_paragraph(f'Algorithm: Weighted Geometric Mean | Base HTS: {base} | β: {beta:.2f}')
     doc.add_page_break()
     # Score details
-    doc.add_heading('📋 Dimension Score Details',level=1)
+    doc.add_heading('📋 Score Details by Dimension',level=1)
     for dim in DIMENSIONS:
         did=dim["id"]; ds=dim_scores.get(did,0)
         doc.add_heading(f'{dim["icon"]} {dim["name"]} — {ds:.1f}/100 (weight {dim["weight"]*100:.0f}%)',level=2)
         dets=scorer.scores.get(did,{}).get("details",{})
+        if not dets:
+            doc.add_paragraph(f'⚠️ Dimension {dim["name"]}({did}) score data missing, check Scanner results')
+            continue
         items=dim["items"]
         t=doc.add_table(rows=len(items)+1,cols=4); t.style='Light Grid Accent 1'
         hdr(t,['Item','Score','Max','Criteria'])
@@ -618,37 +639,37 @@ def gen_word_report(scorer, hts, base, beta, tier, suggestions, dim_scores, sdat
             t.rows[ri+1].cells[0].text=item["label"]
             t.rows[ri+1].cells[1].text=str(sc)
             t.rows[ri+1].cells[2].text=str(item["max"])
-            # Criteria mapping
+            # Criteria descriptions
             criteria_map={
                 "skill_count":"0-3:10, 4-9:15, 10-20:20, 20+:25",
-                "skill_desc":"frontmatter completeness + description structure analysis",
+                "skill_desc":"frontmatter completeness + description structural analysis",
                 "skill_coverage":"domain coverage count × 4",
-                "skill_org":"DESCRIPTION.md(10)+subdirectories(3)+CHANGELOG(3)",
-                "skill_community":"contains community/tap/github keywords",
+                "skill_org":"DESCRIPTION.md(10) + subdirectories(3) + CHANGELOG(3)",
+                "skill_community":"checks for community/tap/github keywords",
                 "cfg_provider":"Provider count × 5",
-                "cfg_fallback":"present & correct format(20)/present but wrong format(12)/none(0)",
+                "cfg_fallback":"has correct format(20) / wrong format(12) / none(0)",
                 "cfg_profile":"Profile count × 7",
                 "cfg_token":"actual detection of max_tokens/context/compress/disable",
-                "cfg_memory":"has memory file(10)/none(7)",
-                "cfg_proxy":"has proxy config(15)/none(5)",
-                "pr_sysprompt":"average frontmatter score (0-25)",
-                "pr_skilldesc":"average description quality score (0-25)",
-                "pr_context":"has max_turns(18)/none(10)",
-                "pr_lang":"bilingual(15)/monolingual(8)",
-                "pr_clarity":"has examples(15)/none(8)",
-                "tool_plugins":"useful plugins(20)/has plugins(10)/none(0)",
-                "tool_gateway":"running(15)/not running(5)",
+                "cfg_memory":"has memory file(10) / none(7)",
+                "cfg_proxy":"has proxy config(15) / none(5)",
+                "pr_sysprompt":"frontmatter average score (0-25)",
+                "pr_skilldesc":"description quality average (0-25)",
+                "pr_context":"has max_turns(18) / none(10)",
+                "pr_lang":"bilingual(15) / monolingual(8)",
+                "pr_clarity":"has examples(15) / none(8)",
+                "tool_plugins":"useful plugins(20) / has plugins(10) / none(0)",
+                "tool_gateway":"running(15) / not running(5)",
                 "tool_cron":"Cron count × 7",
-                "tool_external":"external tools count × 5",
+                "tool_external":"external tool count × 5",
                 "tool_api":"Provider count × 4",
-                "op_memory":"has history(18)/none(10)",
-                "op_iteration":"≥2 runs(18)/single run(12)",
-                "op_community":"yes(20)/no(8)",
-                "op_docs":"has notes(20+)/none(8)",
+                "op_memory":"has history(18) / none(10)",
+                "op_iteration":"≥2 times(18) / single(12)",
+                "op_community":"yes(20) / no(8)",
+                "op_docs":"has notes(20+) / none(8)",
                 "op_automation":"Cron count × 3",
-                "sec_privacy_rules":"has .hermes.md(25)/none(0)",
-                "sec_rule_quality":"quality+rules_count(0-25)",
-                "sec_cross_profile":"configured(20)/not configured(8)",
+                "sec_privacy_rules":"has .hermes.md(25) / none(0)",
+                "sec_rule_quality":"quality + rules_count (0-25)",
+                "sec_cross_profile":"configured(20) / not configured(8)",
                 "sec_data_isolate":".hermes.md 4-dimension analysis (0-15)",
                 "sec_awareness":"rule count × 3 (0-15)",
             }
@@ -661,26 +682,54 @@ def gen_word_report(scorer, hts, base, beta, tier, suggestions, dim_scores, sdat
             tag='🔴' if s["priority"]=="high" else '🟡'
             p=doc.add_paragraph(); r=p.add_run(f'{i}. {tag} {s["icon"]} {s["dimension"]}'); sf(r,bold=True)
             doc.add_paragraph(f'   → {s["suggestion"]}')
-    else: doc.add_paragraph('✅ All dimensions are performing well!')
-    path=Path.home()/"Desktop"/f'Horse_Test_Report_v4_{datetime.date.today().strftime("%Y%m%d")}.docx'
+    else: doc.add_paragraph('✅ All dimensions performing well!')
+    desktop = Path.home() / "Desktop"
+    if not desktop.is_dir():
+        desktop = Path.home() / "Desktop"
+        if not desktop.is_dir():
+            desktop = Path.home()  # fallback to home
+    path=desktop/f'Horse_Test_Report_v4_{datetime.date.today().strftime("%Y%m%d")}.docx'
     doc.save(path); return str(path)
 
 # ============================================================
 # Main Entry
 # ============================================================
 def main():
-    print("🔍 Horse Test v4.0 — Scanning Hermes Agent environment...")
+    import argparse
+    ap = argparse.ArgumentParser(description="Horse Test v4.0 — Hermes Agent Tuning Scoring System")
+    ap.add_argument("--json", action="store_true", help="Output JSON scoring results only")
+    ap.add_argument("--no-word", action="store_true", help="Skip Word report generation")
+    ap.add_argument("--quiet", action="store_true", help="Output score and rank only")
+    args = ap.parse_args()
+
+    if not args.quiet:
+        print("🔍 Horse Test v4.0 — Scanning Hermes Agent environment...")
     sc=Scanner(); sr=Scorer(sc); sr.run()
-    h=load_history(); prev=h[-1].get("hts") if h else None
-    hts,base,beta=calculate_hts(sr.dim_scores,prev)
+    h=load_history(); prev_base=h[-1].get("base") if h else None; prev_hts=h[-1].get("hts") if h else None
+    # Old format history without base field → skip trend correction (prevents delta anomaly from base=0)
+    if prev_base is not None and prev_base == 0 and h and "base" not in h[-1]:
+        prev_base = None
+    hts,base,beta=calculate_hts(sr.dim_scores,prev_base)
     tier=get_tier(hts); sug=gen_suggestions(sr) if hts<800 else []
-    print_report(sr,hts,base,beta,tier,sug,h)
-    save_history(hts,sr.dim_scores)
-    wp=gen_word_report(sr,hts,base,beta,tier,sug,sr.dim_scores,sc.data)
-    if wp: print(f"\n  📄 Word Report: {wp}")
-    print(f"\n💬 SUMMARY|HTS={hts}|TIER={tier['name']}|DIMS=",end="")
-    for dim in DIMENSIONS: print(f"{dim['id']}={sr.dim_scores.get(dim['id'],0):.0f}",end=",")
-    print()
+
+    if args.json:
+        import json as j
+        print(j.dumps({"hts":hts,"base":base,"beta":beta,
+            "tier":{"name":tier["name"],"en":tier["en"],"icon":tier["icon"]},
+            "dimensions":{d["id"]:sr.dim_scores.get(d["id"],0) for d in DIMENSIONS}},
+            ensure_ascii=False,indent=2))
+    elif args.quiet:
+        print(f"HTS={hts}|TIER={tier['name']}|{tier['icon']}")
+    else:
+        print_report(sr,hts,base,beta,tier,sug,h)
+    save_history(hts,base,sr.dim_scores)
+    if not args.no_word:
+        wp=gen_word_report(sr,hts,base,beta,tier,sug,sr.dim_scores,sc.data)
+        if wp: print(f"\n  📄 Word report: {wp}")
+    if not args.quiet and not args.json:
+        print(f"\n💬 SUMMARY|HTS={hts}|TIER={tier['name']}|DIMS=",end="")
+        for dim in DIMENSIONS: print(f"{dim['id']}={sr.dim_scores.get(dim['id'],0):.0f}",end=",")
+        print()
 
 if __name__=="__main__":
     main()
