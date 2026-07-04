@@ -700,7 +700,16 @@ def main():
     ap.add_argument("--json", action="store_true", help="仅输出 JSON 评分结果")
     ap.add_argument("--no-word", action="store_true", help="跳过 Word 报告生成")
     ap.add_argument("--quiet", action="store_true", help="仅输出总分和等级")
+    ap.add_argument("--hermes-home", type=str, default=None,
+                    help="自定义 Hermes 主目录路径（默认：~/.hermes），其他 AI agent 可用此参数指定路径")
     args = ap.parse_args()
+
+    # 支持自定义 HERMES_HOME（其他 AI agent 可用 --hermes-home 指定路径）
+    if args.hermes_home:
+        global HERMES_HOME, HISTORY_FILE, HERMES_MD
+        HERMES_HOME = Path(args.hermes_home).resolve()
+        HISTORY_FILE = HERMES_HOME / "horse-test-history.json"
+        HERMES_MD = HERMES_HOME.with_name(".hermes.md")
 
     if not args.quiet:
         print("🔍 养马测试 v4.0 — 正在扫描 Hermes Agent 环境...")
@@ -710,7 +719,7 @@ def main():
     if prev_base is not None and prev_base == 0 and h and "base" not in h[-1]:
         prev_base = None
     hts,base,beta=calculate_hts(sr.dim_scores,prev_base)
-    tier=get_tier(hts); sug=gen_suggestions(sr) if hts<800 else []
+    tier=get_tier(hts); sug=gen_suggestions(sr) if base<800 else []
 
     if args.json:
         import json as j
